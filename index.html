@@ -778,7 +778,7 @@ const brandSlug = () => (COMPANY.name === BRAND_DEFAULT.name ? 'SISO EXTRA' : (s
 const brandParts = () => { const w = COMPANY.name.trim().split(/\s+/); return { first: w[0].toUpperCase(), rest: w.slice(1).join(' ').toUpperCase() }; };
 
 const ROLES = {
-  owner: { label: 'Owner', menu: ['dashboard', 'prospek', 'jobs', 'produksi', 'desain', 'verifikasi', 'kas', 'pengguna', 'profil'] },
+  owner: { label: 'Owner', menu: ['dashboard', 'prospek', 'jobs', 'produksi', 'desain', 'cl', 'verifikasi', 'kas', 'pengguna', 'profil'] },
   admin_keuangan: { label: 'Admin Keuangan', menu: ['dashboard', 'verifikasi', 'kas'] },
   spv_produksi: { label: 'SPV Produksi', menu: ['produksi'] },
   sales: { label: 'Sales', menu: ['prospek', 'tagihan', 'cl'] },
@@ -810,7 +810,7 @@ const MENU_LABEL = {
   verifikasi: { owner: 'Verifikasi DP & Pelunasan', admin_keuangan: 'Verifikasi DP & Pelunasan' },
   kas: { owner: 'Buku Kas', admin_keuangan: 'Buku Kas' },
   tagihan: { sales: 'Invoice & Tagihan' },
-  cl: { sales: 'CL & Review Desain' },
+  cl: { sales: 'CL & Review Desain', owner: 'CL & ACC Customer' },
   desain: { owner: 'Antrean Desain & Mockup', kru_desain: 'Antrean Desain & Mockup' },
   pengguna: { owner: 'Pengguna & Sales' },
   profil: { owner: 'Profil Brand' }
@@ -861,6 +861,7 @@ const DESIGN_STATUS = {
   none: { label: 'Belum dimulai', tone: 'neutral' },
   draft: { label: 'Menunggu Mockup', tone: 'warn' },
   waiting_customer_acc: { label: 'Menunggu ACC Customer', tone: 'accent' },
+  skipped: { label: 'Tanpa Mockup (Dilewati)', tone: 'neutral' },
   final_approved: { label: 'Final Approved', tone: 'ok' }
 };
 
@@ -1170,6 +1171,62 @@ const qtyBySize = cl => {
 const clComplete = cl => !!cl && cl.members.length > 0 && cl.members.every(m => m.name.trim());
 const latestMockup = p => (p.mockups && p.mockups.length ? p.mockups[p.mockups.length - 1] : null);
 
+/* ---------- Kas yang terkait proyek: DP & pelunasan yang sudah diverifikasi ---------- */
+const PAY_NOTE = { income_dp: 'Pembayaran DP Invoice ', income_pelunasan: 'Pelunasan Invoice ' };
+const cashOfProject = (cash, p) => {
+  if (!p || !p.invoice) return [];
+  return cash.filter(t => PAY_NOTE[t.category] && t.type === 'in' && (t.note || '') === PAY_NOTE[t.category] + p.invoice.no);
+};
+/* Terapkan hasil edit Owner: hitung ulang invoice, status, dan sesuaikan mutasi kas yang sudah tercatat. */
+function applyProjectEdit(p, cash, d) {
+  const now = new Date().toISOString();
+  const client = { name: d.clientName.trim(), wa: (d.wa || '').trim(), address: (d.address || '').trim() };
+  const np = { ...p, name: d.name.trim(), client };
+  if (!p.invoice) np.estimate = Number(d.estimate) || 0;
+  if (p.spk && d.deadline) { const t = new Date(d.deadline + 'T12:00:00'); if (!isNaN(t.getTime())) np.spk = { ...p.spk, deadline: t.toISOString() }; }
+  const mineIds = cashOfProject(cash, p).map(t => t.id);
+  let nc = cash.slice();
+  if (p.invoice) {
+    const inv = p.invoice;
+    const items = d.items.map(i => ({ id: i.id, name: String(i.name).trim(), qty: Number(i.qty) || 0, price: Number(i.price) || 0 }));
+    const total = invTotal(items);
+    const dp = Math.min(total, Math.max(0, Number(d.dpNominal) || 0));
+    const remaining = Math.max(0, total - dp);
+    let settleStatus = inv.settleStatus;
+    if (remaining === 0) settleStatus = 'na';
+    else if (settleStatus === 'na') settleStatus = 'none';
+    const ni = { ...inv, items, total, dpNominal: dp, remaining, settleStatus };
+    if (inv.dpStatus === 'verified' && d.dpAccount) { ni.dpAccount = d.dpAccount; }
+    if (settleStatus === 'na') { ni.settleRequest = null; ni.settleVerifiedAt = null; ni.settleAccount = ''; ni.settleRef = ''; ni.settleReject = ''; }
+    else if (settleStatus === 'verified' && d.settleAccount) { ni.settleAccount = d.settleAccount; }
+    else if (settleStatus === 'submitted' && ni.settleRequest) { ni.settleRequest = { ...ni.settleRequest, amount: remaining }; }
+    np.invoice = ni;
+    /* produksi sudah selesai: status mengikuti kondisi pelunasan yang baru */
+    if (p.spk && p.stageIdx >= 8) {
+      np.status = (settleStatus === 'verified' || settleStatus === 'na') ? 'ready_to_ship'
+        : settleStatus === 'submitted' ? 'pending_settlement_verification' : 'completed_pending_settlement';
+    }
+    const sync = (cat, amount, account, on, when) => {
+      const note = PAY_NOTE[cat] + inv.no;
+      const cur = nc.find(t => t.category === cat && t.note === note);
+      if (!on || amount <= 0) { if (cur) nc = nc.filter(t => t !== cur); return; }
+      if (cur) nc = nc.map(t => (t === cur ? { ...t, amount, account: account || t.account } : t));
+      else nc = [{ id: uid('trx_adj'), type: 'in', category: cat, amount, client: client.name, note, date: when || now, account: account || '' }, ...nc];
+    };
+    sync('income_dp', dp, ni.dpAccount, inv.dpStatus === 'verified', inv.dpVerifiedAt);
+    sync('income_pelunasan', remaining, ni.settleAccount, settleStatus === 'verified', inv.settleVerifiedAt);
+  }
+  if (client.name !== p.client.name) nc = nc.map(t => (mineIds.indexOf(t.id) >= 0 ? { ...t, client: client.name } : t));
+  return { project: np, cash: nc };
+}
+function cashDiff(a, b) {
+  const am = new Map(a.map(t => [t.id, t])), bm = new Map(b.map(t => [t.id, t]));
+  const out = [];
+  b.forEach(t => { const o = am.get(t.id); if (!o) out.push({ kind: 'add', t }); else if (o.amount !== t.amount || o.account !== t.account) out.push({ kind: 'chg', t, o }); });
+  a.forEach(t => { if (!bm.has(t.id)) out.push({ kind: 'del', t }); });
+  return out;
+}
+
 /* ---------- Penyimpanan lokal (Mode Demo, hanya di browser ini) ---------- */
 const STORE_KEY = 'SISO EXTRA-demo-v3';
 const DEMO_USER_OF_ROLE = { owner: 'u-owner', admin_keuangan: 'u-fin', spv_produksi: 'u-spv', sales: 'u-s1', kru_desain: 'u-des', kru_lapangan: 'u-lap' };
@@ -1278,7 +1335,7 @@ function buildDoc(type, p) {
       ...specImgBlock(cl),
       { t: 'text', label: 'Catatan Lapangan', body: (cl.notes || '').trim() || '-' },
       { t: 'h', text: 'Panduan Visual Mockup Kerja' },
-      mk ? { t: 'image', src: mk.url, caption: 'Mockup ' + mk.version + ' (final)', maxH: 95 } : { t: 'text', label: '', body: 'Mockup belum tersedia.' },
+      mk ? { t: 'image', src: mk.url, caption: 'Mockup ' + mk.version + ' (final)', maxH: 95 } : { t: 'text', label: '', body: 'Mockup belum tersedia (desain dilewati atau menyusul). Ikuti spesifikasi penempatan artwork di bawah.' },
       { t: 'h', text: 'Daftar Nama untuk Potong & Bordir' },
       { t: 'table', head: ['No', 'Nama Personil', 'Jabatan', 'Ukuran', 'Keterangan Varian'], widths: [7, 33, 25, 12, 23], align: ['c', 'l', 'l', 'c', 'l'], body: membersTable(cl) },
       { t: 'h', text: 'Lembar Kontrol 8 Tahap Produksi' },
@@ -1817,7 +1874,10 @@ const CASH_ROLES = ['owner', 'admin_keuangan'];
    cb: { projects(updater), cash(updater), status(s), toast(text, tone), latest() -> {projects, cash} } */
 function createCloudStore(client, user, cb) {
   const known = new Map();      /* id proyek -> { ref, rev } (ref = objek yang terakhir sinkron) */
-  const knownCash = new Set();
+  const knownCash = new Map();   /* id kas -> objek yang terakhir sinkron */
+  const delProj = new Map();     /* id proyek yang menunggu dihapus di server -> id kas terkaitnya */
+  const delCash = new Set();     /* id kas yang menunggu dihapus di server */
+  const sameCash = (a, b) => a.type === b.type && a.category === b.category && a.amount === b.amount && a.client === b.client && a.note === b.note && a.account === b.account;
   const inflight = new Set(), deferred = new Set();
   let timer = null, retry = null, saving = false, again = false, dead = false, channel = null, ready = false;
   const canCash = CASH_ROLES.includes(user.role);
@@ -1842,7 +1902,7 @@ function createCloudStore(client, user, cb) {
     const { projectRows, cashRows } = await fetchAll();
     const projects = projectRows.map(r => { const p = r.data; known.set(p.id, { ref: p, rev: r.rev }); return p; }).sort(byNewest);
     const cash = cashRows.map(rowToCash);
-    cash.forEach(t => knownCash.add(t.id));
+    cash.forEach(t => knownCash.set(t.id, t));
     ready = true;
     return { projects, cash };
   }
@@ -1870,8 +1930,16 @@ function createCloudStore(client, user, cb) {
         });
         if (!quiet) cb.toast(incoming.length + ' data diperbarui dari perangkat / pengguna lain.', 'warn');
       }
-      const newCash = cashRows.filter(r => !knownCash.has(r.id)).map(rowToCash);
-      if (newCash.length) { newCash.forEach(t => knownCash.add(t.id)); cb.cash(cs => newCash.concat(cs).sort((a, b) => new Date(b.date) - new Date(a.date))); }
+      const newCash = cashRows.filter(r => !knownCash.has(r.id) && !delCash.has(r.id)).map(rowToCash);
+      if (newCash.length) { newCash.forEach(t => knownCash.set(t.id, t)); cb.cash(cs => newCash.concat(cs).sort((a, b) => new Date(b.date) - new Date(a.date))); }
+      const localCash = new Map(cb.latest().cash.map(t => [t.id, t]));
+      const changed = [];
+      cashRows.forEach(r => {
+        const k = knownCash.get(r.id), t = rowToCash(r);
+        if (!k || sameCash(k, t) || localCash.get(r.id) !== k) return;   /* tidak berubah, atau ada perubahan lokal yang belum tersimpan */
+        knownCash.set(r.id, t); changed.push(t);
+      });
+      if (changed.length) cb.cash(cs => cs.map(x => changed.find(t => t.id === x.id) || x));
     } catch (e) { /* biarkan; status simpan menampilkan masalah koneksi */ }
   }
 
@@ -1880,6 +1948,24 @@ function createCloudStore(client, user, cb) {
     if (error || !data) return;
     known.set(id, { ref: data.data, rev: data.rev });
     cb.projects(ps => ps.map(x => (x.id === id ? data.data : x)));
+  }
+
+  /* Server menolak hapus/ubah (mis. RLS): ambil data asli dan kembalikan ke daftar lokal. */
+  async function restoreProject(id) {
+    known.delete(id);
+    const { data } = await client.from('projects').select('id,rev,data').eq('id', id).maybeSingle();
+    if (!data) return false;
+    known.set(id, { ref: data.data, rev: data.rev });
+    cb.projects(ps => (ps.some(x => x.id === id) ? ps.map(x => (x.id === id ? data.data : x)) : ps.concat([data.data])).sort(byNewest));
+    return true;
+  }
+  async function restoreCash(id) {
+    const { data } = await client.from('cash').select('*').eq('id', id).maybeSingle();
+    if (!data) { knownCash.delete(id); return false; }
+    const t = rowToCash(data);
+    knownCash.set(id, t);
+    cb.cash(cs => (cs.some(x => x.id === id) ? cs.map(x => (x.id === id ? t : x)) : [t].concat(cs)));
+    return true;
   }
 
   async function flush() {
@@ -1891,7 +1977,8 @@ function createCloudStore(client, user, cb) {
       const { projects, cash } = cb.latest();
       const ups = projects.filter(p => { const k = known.get(p.id); return !k || k.ref !== p; });
       const newCash = canCash ? cash.filter(t => !knownCash.has(t.id)) : [];
-      if (!ups.length && !newCash.length) { saving = false; setStatus('ok'); return; }
+      const editCash = canCash ? cash.filter(t => knownCash.has(t.id) && knownCash.get(t.id) !== t) : [];
+      if (!ups.length && !newCash.length && !editCash.length && !delProj.size && !delCash.size) { saving = false; setStatus('ok'); return; }
       setStatus('saving');
       ups.forEach(p => inflight.add(p.id));
       for (const p of ups) {
@@ -1914,10 +2001,41 @@ function createCloudStore(client, user, cb) {
           known.set(p.id, { ref: p, rev: r.data[0].rev });
         }
       }
+      /* hapus proyek (Owner): kas terkait ikut dihapus hanya bila proyeknya benar-benar terhapus */
+      for (const [pid, cids] of Array.from(delProj.entries())) {
+        const r = await client.from('projects').delete().eq('id', pid).select('id');
+        if (r.error) throw r.error;
+        if (r.data && r.data.length) { known.delete(pid); delProj.delete(pid); continue; }
+        delProj.delete(pid);
+        const back = await restoreProject(pid);
+        if (back) {
+          cids.forEach(cid => delCash.delete(cid));
+          for (const cid of cids) await restoreCash(cid);
+          cb.toast('Server menolak penghapusan proyek (izin DELETE untuk Owner belum aktif). Proyek dikembalikan.', 'bad'); failed = true; message = 'Hapus ditolak server';
+        }
+      }
+      if (delCash.size) {
+        const ids = Array.from(delCash);
+        const r = await client.from('cash').delete().in('id', ids).select('id');
+        if (r.error) throw r.error;
+        const okIds = new Set((r.data || []).map(x => x.id));
+        for (const id of ids) {
+          delCash.delete(id);
+          if (okIds.has(id)) { knownCash.delete(id); continue; }
+          if (await restoreCash(id)) { cb.toast('Server menolak penghapusan mutasi kas (izin DELETE untuk Owner belum aktif). Mutasi dikembalikan.', 'bad'); failed = true; message = 'Hapus kas ditolak server'; }
+        }
+      }
+      for (const t of editCash) {
+        const r = await client.from('cash').update(cashToRow(t)).eq('id', t.id).select('id');
+        if (r.error) throw r.error;
+        if (r.data && r.data.length) { knownCash.set(t.id, t); continue; }
+        await restoreCash(t.id);
+        cb.toast('Server menolak perubahan mutasi kas (izin UPDATE untuk Owner belum aktif). Nilai asli dikembalikan.', 'bad'); failed = true; message = 'Ubah kas ditolak server';
+      }
       if (newCash.length) {
         const r = await client.from('cash').insert(newCash.map(cashToRow));
         if (r.error && r.error.code !== '23505') throw r.error;
-        newCash.forEach(t => knownCash.add(t.id));
+        newCash.forEach(t => knownCash.set(t.id, t));
       }
     } catch (e) {
       failed = true; message = (e && e.message) || 'Gagal menyimpan';
@@ -1931,8 +2049,21 @@ function createCloudStore(client, user, cb) {
     setStatus(failed ? 'error' : 'ok', message);
   }
 
-  function pendingCash() { const l = cb.latest(); return canCash ? l.cash.filter(t => !knownCash.has(t.id)).length : 0; }
-  function pendingProjects() { const l = cb.latest(); return l.projects.filter(p => { const k = known.get(p.id); return !k || k.ref !== p; }).length; }
+  function pendingCash() { const l = cb.latest(); return canCash ? l.cash.filter(t => !knownCash.has(t.id) || knownCash.get(t.id) !== t).length + delCash.size : 0; }
+  function pendingProjects() { const l = cb.latest(); return l.projects.filter(p => { const k = known.get(p.id); return !k || k.ref !== p; }).length + delProj.size; }
+  /* Owner menghapus proyek / mutasi kas: antre ke server (hanya yang memang sudah pernah tersimpan di sana). */
+  function removeProject(id, cashIds) {
+    if (dead) return;
+    const cids = (cashIds || []).filter(x => knownCash.has(x));
+    if (known.has(id)) { delProj.set(id, cids); cids.forEach(x => delCash.add(x)); }
+    else cids.forEach(x => delCash.add(x));
+    push();
+  }
+  function removeCash(ids) {
+    if (dead) return;
+    (ids || []).filter(x => knownCash.has(x)).forEach(x => delCash.add(x));
+    push();
+  }
   function push() {
     if (dead || !ready) return;
     if (pendingProjects() + pendingCash() === 0) return;
@@ -1968,18 +2099,25 @@ function createCloudStore(client, user, cb) {
     syncOne(row.id);
   }
   function onCashEvent(payload) {
-    if (dead || !payload.new) return;
+    if (dead) return;
+    if (payload.eventType === 'DELETE') {
+      const id = payload.old && payload.old.id;
+      if (id) { knownCash.delete(id); delCash.delete(id); cb.cash(cs => cs.filter(t => t.id !== id)); }
+      return;
+    }
+    if (!payload.new) return;
     const t = rowToCash(payload.new);
-    if (knownCash.has(t.id)) return;
-    knownCash.add(t.id);
-    cb.cash(cs => [t].concat(cs));
+    const k = knownCash.get(t.id);
+    if (k && sameCash(k, t)) return;
+    knownCash.set(t.id, t);
+    cb.cash(cs => (cs.some(x => x.id === t.id) ? cs.map(x => (x.id === t.id ? t : x)) : [t].concat(cs)));
   }
 
   function subscribe() {
     if (dead) return;
     channel = client.channel('SISO-live-' + user.id)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, onProjectEvent);
-    if (canCash) channel = channel.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'cash' }, onCashEvent);
+    if (canCash) channel = channel.on('postgres_changes', { event: '*', schema: 'public', table: 'cash' }, onCashEvent);
     channel.subscribe(st => { if (!dead && st === 'SUBSCRIBED') refresh(true); });
     const wake = () => { if (document.visibilityState !== 'hidden') refresh(true); };
     document.addEventListener('visibilitychange', wake);
@@ -1992,7 +2130,7 @@ function createCloudStore(client, user, cb) {
     stopFns.forEach(f => f());
     try { if (channel) client.removeChannel(channel); } catch (e) { /* abaikan */ }
   }
-  return { load, push, flush, refresh, subscribe, stop, pendingCount: () => pendingProjects() + pendingCash() };
+  return { load, push, flush, refresh, subscribe, stop, removeProject, removeCash, pendingCount: () => pendingProjects() + pendingCash() };
 }
 
 /* ---------- Manajemen pengguna (hanya Owner yang diizinkan oleh RLS) ---------- */
@@ -2321,34 +2459,37 @@ function VerifikasiView({ c }) {
 
 function ClView({ c }) {
   const list = c.projects.filter(p => p.cl && p.invoice && p.invoice.dpStatus === 'verified').sort((a, b) => (a.cl.locked ? 1 : 0) - (b.cl.locked ? 1 : 0));
-  return h`<div className="stack"><p className="muted">CL bisa diubah kapan saja sampai customer ACC final. Setelah dikunci, SPK terbit dan proyek masuk antrean lapangan.</p>
+  return h`<div className="stack"><p className="muted">CL bisa diubah kapan saja sampai customer ACC final. Mockup opsional: tanpa mockup pun CL bisa di-ACC. Setelah dikunci, SPK terbit dan proyek masuk antrean lapangan.</p>
     ${!list.length ? h`<${Empty}>Belum ada proyek dengan DP terverifikasi.<//>` : null}
     <ul className="rows">${list.map(p => {
       const mk = latestMockup(p), cl = p.cl, why = [];
       if (!cl.members.length) why.push('isi daftar personil');
       else if (!clComplete(cl)) why.push('lengkapi nama personil');
-      if (!mk) why.push('menunggu mockup dari Kru Desain');
       const ready = !cl.locked && why.length === 0;
       return h`<li key=${p.id} className="row col">
         <div className="row-top"><div className="row-main"><b>${p.name}</b><span>${p.client.name} · CL v${cl.version} · ${cl.category.toUpperCase()}</span></div>
           <div className="tags"><${Badge} tone=${DESIGN_STATUS[p.designStatus].tone}>${DESIGN_STATUS[p.designStatus].label}<//>${cl.locked ? h`<${Badge} tone="ok"><${Ico} n="lock" s=${11} /> Terkunci<//>` : null}</div></div>
         <div className="cl-split">
-          <div className="thumb">${mk ? h`<img src=${mk.url} alt=${'Mockup ' + mk.version} /><small>Mockup ${mk.version}</small>` : h`<div className="thumb-empty">Mockup belum diunggah</div>`}</div>
+          <div className="thumb">${mk ? h`<img src=${mk.url} alt=${'Mockup ' + mk.version} /><small>Mockup ${mk.version}</small>` : h`<div className="thumb-empty">${p.designStatus === 'skipped' ? 'Tanpa mockup (dilewati)' : 'Mockup belum diunggah (opsional)'}</div>`}</div>
           <div className="cl-sum"><span>${cl.members.length} personil${specImgs(cl).length ? ' · ' + specImgs(cl).length + ' gambar posisi terlampir' : ''}</span><${SizeGrid} cl=${cl} />
-            ${!cl.locked && why.length ? h`<p className="hintline"><${Ico} n="alert" s=${13} /> Sebelum ACC: ${why.join(', ')}.</p>` : null}</div></div>
+            ${!cl.locked && why.length ? h`<p className="hintline"><${Ico} n="alert" s=${13} /> Sebelum ACC: ${why.join(', ')}.</p>` : null}
+            ${!cl.locked && !mk ? h`<p className="muted">Mockup bersifat opsional. CL tetap bisa di-ACC dan produksi jalan; mockup bisa diunggah menyusul lewat Antrean Desain.</p>` : null}</div></div>
         <div className="row-act">
           ${!cl.locked ? h`<button className="btn" onClick=${() => c.open({ type: 'cl', pid: p.id })}><${Ico} n="pen" s=${14} /> Edit CL</button>` : null}
-          ${!cl.locked ? h`<button className="btn ok" disabled=${!ready} onClick=${() => c.A.approveCL(p.id)}><${Ico} n="check" /> Customer ACC / Konfirmasi Final CL</button>` : null}
+          ${!cl.locked && !mk && p.designStatus !== 'skipped' ? h`<button className="btn" onClick=${() => c.A.skipDesign(p.id)}>Lewati Desain</button>` : null}
+          ${!cl.locked ? h`<button className="btn ok" disabled=${!ready} onClick=${() => c.A.approveCL(p.id)}><${Ico} n="check" /> ${mk ? 'Customer ACC / Konfirmasi Final CL' : 'ACC & Mulai Produksi (tanpa mockup)'}</button>` : null}
           <button className="btn" onClick=${() => c.open({ type: 'doc', doc: 'cl', pid: p.id })}><${Ico} n="doc" s=${14} /> Dokumen CL</button>
           ${p.spk ? h`<button className="btn" onClick=${() => c.open({ type: 'doc', doc: 'spk', pid: p.id })}><${Ico} n="doc" s=${14} /> SPK ${p.spk.no}</button>` : null}</div></li>`;
     })}</ul></div>`;
 }
 
 function DesainView({ c }) {
-  const list = c.projects.filter(p => p.status === 'cl_design_draft');
-  return h`<div className="stack"><p className="muted">Antrean CL yang butuh mockup. CL yang terlihat di sini selalu versi terbaru dari Sales.</p>
-    ${!list.length ? h`<${Empty}>Tidak ada pesanan yang menunggu desain.<//>` : null}
-    <ul className="rows">${list.map(p => {
+  const live = c.projects.filter(p => p.cl && p.invoice && p.invoice.dpStatus === 'verified');
+  const queue = live.filter(p => p.status === 'cl_design_draft' && p.designStatus !== 'skipped');
+  const later = live.filter(p => !p.mockups.length && ['cl_design_draft', 'in_production', 'in_rework'].includes(p.status) && (p.designStatus === 'skipped' || p.status !== 'cl_design_draft'));
+  return h`<div className="stack"><p className="muted">Antrean CL yang butuh mockup. Mockup bersifat opsional: pesanan boleh dilewati dan tetap masuk produksi, mockup bisa diunggah menyusul.</p>
+    ${!queue.length && !later.length ? h`<${Empty}>Tidak ada pesanan yang menunggu desain.<//>` : null}
+    ${queue.length ? h`<ul className="rows">${queue.map(p => {
       const cl = p.cl;
       return h`<li key=${p.id} className="row col">
         <div className="row-top"><div className="row-main"><b>${p.name}</b><span>${p.client.name} · ${cl.category.toUpperCase()} · CL v${cl.version}${cl.submitted ? ' (diperbarui Sales)' : ' (draf)'}</span></div>
@@ -2359,8 +2500,12 @@ function DesainView({ c }) {
           <div><h4 className="mini">Daftar personil (${cl.members.length})</h4>
             ${cl.members.length ? h`<div className="scroll small"><table className="tbl"><thead><tr><th>Nama</th><th>Jabatan</th><th>Ukuran</th></tr></thead><tbody>${cl.members.map(m => h`<tr key=${m.id}><td>${m.name || '-'}</td><td>${m.position || '-'}</td><td>${m.size}</td></tr>`)}</tbody></table></div>` : h`<p className="muted">Sales belum mengisi daftar personil.</p>`}</div></div>
         ${p.mockups.length ? h`<div className="mockrow">${p.mockups.map(m => h`<figure key=${m.id}><img src=${m.url} alt=${'Mockup ' + m.version} /><figcaption>${m.version} · ${fmtDate(m.at)}${m.note ? ' · ' + m.note : ''}</figcaption></figure>`)}</div>` : null}
-        <div className="row-act"><button className="btn primary" onClick=${() => c.open({ type: 'mockup', pid: p.id })}><${Ico} n="up" /> ${p.mockups.length ? 'Unggah Revisi Mockup' : 'Unggah Mockup'}</button></div></li>`;
-    })}</ul></div>`;
+        <div className="row-act"><button className="btn primary" onClick=${() => c.open({ type: 'mockup', pid: p.id })}><${Ico} n="up" /> ${p.mockups.length ? 'Unggah Revisi Mockup' : 'Unggah Mockup'}</button>
+          ${!p.mockups.length ? h`<button className="btn" onClick=${() => c.A.skipDesign(p.id)}>Lewati Desain</button>` : null}</div></li>`;
+    })}</ul>` : null}
+    ${later.length ? h`<section><h3 className="sec">Tanpa mockup / menyusul <${Badge} tone="neutral">${later.length}<//></h3>
+      <ul className="rows">${later.map(p => h`<li key=${p.id} className="row"><div className="row-main"><b>${p.name}</b><span>${p.client.name} · ${p.spk ? p.spk.no : 'belum ada SPK'}</span></div>
+        <div className="row-act"><${StatusBadge} status=${p.status} /><button className="btn sm" onClick=${() => c.open({ type: 'mockup', pid: p.id })}><${Ico} n="up" s=${14} /> Unggah Mockup</button></div></li>`)}</ul></section>` : null}</div>`;
 }
 
 function ProduksiView({ c }) {
@@ -2425,7 +2570,8 @@ function JobsView({ c }) {
       <div className="row-act"><${StatusBadge} status=${p.status} />
         ${p.invoice ? h`<button className="btn sm" onClick=${() => c.open({ type: 'doc', doc: 'invoice', pid: p.id })}>Invoice</button>` : null}
         ${p.cl && p.cl.members.length ? h`<button className="btn sm" onClick=${() => c.open({ type: 'doc', doc: 'cl', pid: p.id })}>CL</button>` : null}
-        ${p.spk ? h`<button className="btn sm" onClick=${() => c.open({ type: 'doc', doc: 'spk', pid: p.id })}>SPK</button>` : null}</div></li>`)}</ul></div>`;
+        ${p.spk ? h`<button className="btn sm" onClick=${() => c.open({ type: 'doc', doc: 'spk', pid: p.id })}>SPK</button>` : null}
+        ${c.role === 'owner' ? h`<button className="btn sm" onClick=${() => c.open({ type: 'edit', pid: p.id })}><${Ico} n="pen" s=${13} /> Edit</button><button className="btn sm danger" onClick=${() => c.open({ type: 'delete', pid: p.id })}><${Ico} n="trash" s=${13} /> Hapus</button>` : null}</div></li>`)}</ul></div>`;
 }
 
 /* ---------- Modals ---------- */
@@ -2594,9 +2740,70 @@ function MoveModal({ c, pid, to, onClose }) {
     <p className="muted">Posisi sekarang: <b>${finished ? 'Selesai' : (idx + 1) + '. ' + STAGES[idx]}</b></p>
     <div className="row-act">
       ${!finished ? h`<button className="btn" onClick=${() => { onClose(); c.open({ type: 'progress', pid }); }}><${Ico} n="cam" s=${14} /> Update Progres (foto bukti)</button>` : null}
-      <button className="btn" onClick=${() => { onClose(); c.open({ type: 'doc', doc: 'spk', pid }); }}><${Ico} n="doc" s=${14} /> Lembar SPK</button></div>
+      <button className="btn" onClick=${() => { onClose(); c.open({ type: 'doc', doc: 'spk', pid }); }}><${Ico} n="doc" s=${14} /> Lembar SPK</button>
+      <button className="btn" onClick=${() => { onClose(); c.open({ type: 'edit', pid }); }}><${Ico} n="pen" s=${14} /> Edit Proyek</button>
+      <button className="btn danger" onClick=${() => { onClose(); c.open({ type: 'delete', pid }); }}><${Ico} n="trash" s=${14} /> Hapus Proyek</button></div>
     <${Field} label="Geser ke tahap" hint="Bisa maju atau mundur. Mundur dari Selesai akan membuka kembali produksi."><select id="mv-stage" value=${target} onChange=${e => setTarget(Number(e.target.value))}>${STAGES.map((s, i) => h`<option key=${s} value=${i}>${i + 1}. ${s}</option>`)}</select><//>
     <${Field} label="Alasan / catatan (wajib)"><textarea id="mv-note" rows="3" value=${note} onChange=${e => setNote(e.target.value)} placeholder="mis. koreksi tahap, salah input kru"></textarea><//><//>`;
+}
+
+function EditProjectModal({ c, pid, onClose }) {
+  const p = c.projects.find(x => x.id === pid);
+  const inv = p ? p.invoice : null;
+  const [name, setName] = useState(p ? p.name : '');
+  const [cname, setCname] = useState(p ? p.client.name : '');
+  const [wa, setWa] = useState(p ? p.client.wa || '' : '');
+  const [address, setAddress] = useState(p ? p.client.address || '' : '');
+  const [est, setEst] = useState(p ? String(p.estimate || 0) : '0');
+  const [deadline, setDeadline] = useState(p && p.spk ? String(p.spk.deadline).slice(0, 10) : '');
+  const [items, setItems] = useState(() => (inv ? inv.items.map(i => ({ ...i })) : []));
+  const [dp, setDp] = useState(inv ? String(inv.dpNominal) : '0');
+  const [dpAcc, setDpAcc] = useState(inv ? inv.dpAccount || '' : '');
+  const [stAcc, setStAcc] = useState(inv ? inv.settleAccount || '' : '');
+  if (!p) return null;
+  const setItem = (id, k, v) => setItems(its => its.map(i => (i.id === id ? { ...i, [k]: v } : i)));
+  const total = inv ? invTotal(items) : 0, dpN = Number(dp) || 0;
+  const itemsOk = !inv || (items.length > 0 && items.every(i => String(i.name).trim() && Number(i.qty) > 0 && Number(i.price) >= 0));
+  const valid = name.trim() && cname.trim() && itemsOk && (!inv || (total > 0 && dpN <= total));
+  const draft = { name, clientName: cname, wa, address, estimate: est, deadline, items, dpNominal: dp, dpAccount: dpAcc, settleAccount: stAcc };
+  const diff = valid ? cashDiff(c.cash, applyProjectEdit(p, c.cash, draft).cash) : [];
+  const dpVer = inv && inv.dpStatus === 'verified', stVer = inv && inv.settleStatus === 'verified';
+  return h`<${Modal} wide=${true} title="Edit Proyek" sub=${p.code + ' · ' + (STATUS[p.status] ? STATUS[p.status].label : p.status)} onClose=${onClose}
+    footer=${h`<button className="btn" onClick=${onClose}>Batal</button><button className="btn primary" disabled=${!valid} onClick=${() => { c.A.editProject(pid, draft); onClose(); }}>Simpan Perubahan</button>`}>
+    <${Field} label="Nama proyek"><input id="ep-name" value=${name} onChange=${e => setName(e.target.value)} /><//>
+    <${Field} label="Nama klien"><input id="ep-client" value=${cname} onChange=${e => setCname(e.target.value)} /><//>
+    <${Field} label="WhatsApp klien"><input id="ep-wa" value=${wa} onChange=${e => setWa(e.target.value)} /><//>
+    <${Field} label="Alamat"><input id="ep-addr" value=${address} onChange=${e => setAddress(e.target.value)} /><//>
+    ${!inv ? h`<${Field} label="Estimasi nilai (Rp)"><input id="ep-est" inputMode="numeric" value=${est} onChange=${e => setEst(e.target.value.replace(/\D/g, ''))} /><//>` : null}
+    ${p.spk ? h`<${Field} label=${'Deadline SPK ' + p.spk.no}><input id="ep-dl" type="date" value=${deadline} onChange=${e => setDeadline(e.target.value)} /><//>` : null}
+    ${inv ? h`<h4 className="mini">Invoice ${inv.no}</h4>
+      <div className="scroll flat"><table className="tbl edit inv"><thead><tr><th>Nama item</th><th className="num">Qty</th><th className="num">Harga satuan (Rp)</th><th className="num">Subtotal</th><th></th></tr></thead>
+        <tbody>${items.map(i => h`<tr key=${i.id}>
+          <td data-l="Nama item"><input aria-label="Nama item" value=${i.name} onChange=${e => setItem(i.id, 'name', e.target.value)} /></td>
+          <td className="num" data-l="Qty"><input aria-label="Qty" inputMode="numeric" value=${i.qty} onChange=${e => setItem(i.id, 'qty', e.target.value.replace(/\D/g, ''))} /></td>
+          <td className="num" data-l="Harga satuan (Rp)"><input aria-label="Harga satuan" inputMode="numeric" value=${i.price} onChange=${e => setItem(i.id, 'price', e.target.value.replace(/\D/g, ''))} /></td>
+          <td className="num strong" data-l="Subtotal">${rp((Number(i.qty) || 0) * (Number(i.price) || 0))}</td>
+          <td><button className="icon-btn" aria-label="Hapus baris" disabled=${items.length < 2} onClick=${() => setItems(its => its.filter(x => x.id !== i.id))}><${Ico} n="trash" s=${15} /></button></td></tr>`)}</tbody></table></div>
+      <button className="btn sm" onClick=${() => setItems(its => [...its, { id: uid('i'), name: '', qty: 1, price: 0 }])}><${Ico} n="plus" s=${14} /> Tambah Item</button>
+      <${Field} label="Nominal DP (Rp)"><input id="ep-dp" inputMode="numeric" value=${dp} onChange=${e => setDp(e.target.value.replace(/\D/g, ''))} /><//>
+      ${dpVer ? h`<${Field} label="DP masuk ke rekening"><select id="ep-dpacc" value=${dpAcc} onChange=${e => setDpAcc(e.target.value)}>${cashSources(dpAcc).map(a => h`<option key=${a}>${a}</option>`)}</select><//>` : null}
+      ${stVer ? h`<${Field} label="Pelunasan masuk ke rekening"><select id="ep-stacc" value=${stAcc} onChange=${e => setStAcc(e.target.value)}>${cashSources(stAcc).map(a => h`<option key=${a}>${a}</option>`)}</select><//>` : null}
+      <div className="sumbox"><div><span>Grand Total</span><b>${rp(total)}</b></div><div><span>DP</span><b>${rp(Math.min(dpN, total))}</b></div><div className="strong"><span>Sisa pelunasan</span><b>${rp(Math.max(0, total - dpN))}</b></div></div>
+      ${dpN > total ? h`<p className="errline">DP tidak boleh melebihi total invoice.</p>` : null}` : null}
+    ${diff.length ? h`<div className="callout warnbox"><${Ico} n="alert" /> <span><b>Buku Kas akan disesuaikan:</b>${diff.map(x => h`<div key=${x.t.id}>${CASH_CATS[x.t.category] || x.t.category}${x.kind === 'chg' ? ': ' + rp(x.o.amount) + ' → ' + rp(x.t.amount) + (x.o.account !== x.t.account ? ' · rekening ' + (x.o.account || '-') + ' → ' + (x.t.account || '-') : '') : x.kind === 'add' ? ': ditambahkan ' + rp(x.t.amount) : ': dihapus ' + rp(x.t.amount)}</div>`)}</span></div>` : null}<//>`;
+}
+
+function DeleteProjectModal({ c, pid, onClose }) {
+  const p = c.projects.find(x => x.id === pid);
+  if (!p) return null;
+  const txs = cashOfProject(c.cash, p);
+  const sum = txs.reduce((a, t) => a + t.amount, 0);
+  return h`<${Modal} title="Hapus Proyek" sub=${p.name + ' · ' + p.client.name} onClose=${onClose}
+    footer=${h`<button className="btn" onClick=${onClose}>Batal</button><button className="btn danger" onClick=${() => { c.A.deleteProject(pid); onClose(); }}><${Ico} n="trash" s=${14} /> Ya, Hapus${txs.length ? ' & Koreksi Kas' : ''}</button>`}>
+    <p>Proyek <b>${p.name}</b> (${p.code}${p.spk ? ' · ' + p.spk.no : ''}) akan dihapus permanen beserta invoice, CL, mockup, SPK, dan log produksinya.</p>
+    ${txs.length ? h`<div className="callout warnbox"><${Ico} n="alert" /> <span><b>Mutasi kas berikut ikut dihapus (saldo kas berkurang ${rp(sum)}):</b>${txs.map(t => h`<div key=${t.id}>${CASH_CATS[t.category]} · ${rp(t.amount)} · ${t.account || '-'} · ${fmtDate(t.date)}</div>`)}</span></div>`
+      : h`<p className="muted">Belum ada pembayaran yang masuk Buku Kas, jadi saldo kas tidak berubah.</p>`}
+    <p className="muted">Tindakan ini tidak bisa dibatalkan.</p><//>`;
 }
 
 function SettleModal({ c, pid, onClose }) {
@@ -3144,17 +3351,24 @@ function App({ boot }) {
       upd(id, p => ({ ...p, cl: { ...cl, updatedAt: new Date().toISOString(), submitted: submit || cl.submitted, version: submit && p.cl.submitted ? p.cl.version + 1 : p.cl.version } }));
       toast(submit ? 'CL dikirim ke Tim Desain.' : 'Draf CL tersimpan.');
     },
+    skipDesign: id => {
+      const p = projects.find(x => x.id === id);
+      if (!p || (p.mockups && p.mockups.length) || (p.cl && p.cl.locked)) return;
+      upd(id, x => ({ ...x, designStatus: 'skipped' }));
+      toast('Desain dilewati. Proyek tetap bisa di-ACC dan masuk produksi; mockup bisa diunggah menyusul.');
+    },
     uploadMockup: (id, d) => {
-      upd(id, p => ({ ...p, designStatus: 'waiting_customer_acc', mockups: [...p.mockups, { id: uid('mk'), url: d.url, note: d.note, version: 'v' + (p.mockups.length + 1), by: user.name, at: new Date().toISOString() }] }));
+      upd(id, p => ({ ...p, designStatus: p.cl && p.cl.locked ? 'final_approved' : 'waiting_customer_acc', mockups: [...p.mockups, { id: uid('mk'), url: d.url, note: d.note, version: 'v' + (p.mockups.length + 1), by: user.name, at: new Date().toISOString() }] }));
       toast('Mockup terkirim ke Sales untuk direview customer.');
     },
     approveCL: id => {
       const p = projects.find(x => x.id === id);
       if (!p || !p.invoice || p.invoice.dpStatus !== 'verified' || !p.cl || p.cl.locked) return;
-      if (!clComplete(p.cl) || !latestMockup(p)) { toast('Lengkapi daftar personil dan tunggu mockup sebelum ACC.', 'bad'); return; }
+      if (!clComplete(p.cl)) { toast('Lengkapi daftar personil sebelum ACC. Mockup tidak wajib.', 'bad'); return; }
       const spk = { no: 'SPK-' + ym() + '-' + tagOf(p) + '-' + pad(maxSuffix(projects, 'spk', p.salesCode) + 1), deadline: daysAhead(14), material: p.cl.spec.bahan || '', issuedAt: new Date().toISOString() };
-      upd(id, x => ({ ...x, status: 'in_production', designStatus: 'final_approved', cl: { ...x.cl, locked: true }, spk, stageIdx: 0 }));
-      toast('Desain & CL telah di-ACC Customer! ' + spk.no + ' resmi terbit ke lantai produksi.');
+      const hasMk = !!latestMockup(p);
+      upd(id, x => ({ ...x, status: 'in_production', designStatus: hasMk ? 'final_approved' : 'skipped', cl: { ...x.cl, locked: true }, spk, stageIdx: 0 }));
+      toast(hasMk ? 'Desain & CL telah di-ACC Customer! ' + spk.no + ' resmi terbit ke lantai produksi.' : 'CL di-ACC tanpa mockup. ' + spk.no + ' terbit ke lantai produksi; mockup bisa menyusul.');
     },
     finishStage: (id, d) => {
       if (role !== 'kru_lapangan' && role !== 'owner') { toast('Hanya Kru Lapangan atau Owner yang dapat memperbarui progres produksi.', 'bad'); return; }
@@ -3203,6 +3417,28 @@ function App({ boot }) {
       upd(id, x => ({ ...x, status: 'completed_pending_settlement', invoice: { ...x.invoice, settleStatus: 'none', settleRequest: null, settleReject: (reason || '').trim() || 'Data pembayaran belum sesuai' } }));
       toast('Pengajuan dikembalikan ke Sales dengan catatan.', 'warn');
     },
+    editProject: (id, d) => {
+      if (role !== 'owner') { toast('Hanya Owner yang dapat mengedit proyek.', 'bad'); return; }
+      const p = projects.find(x => x.id === id);
+      if (!p) return;
+      const res = applyProjectEdit(p, cash, d);
+      const diff = cashDiff(cash, res.cash);
+      setProjects(ps => ps.map(x => (x.id === id ? res.project : x)));
+      if (diff.length) setCash(() => res.cash);
+      const gone = diff.filter(x => x.kind === 'del').map(x => x.t.id);
+      if (cloud && storeRef.current && gone.length) storeRef.current.removeCash(gone);
+      toast('Proyek ' + res.project.name + ' diperbarui' + (diff.length ? '. Buku Kas ikut disesuaikan (' + diff.length + ' mutasi).' : '.'), diff.length ? 'warn' : 'ok');
+    },
+    deleteProject: id => {
+      if (role !== 'owner') { toast('Hanya Owner yang dapat menghapus proyek.', 'bad'); return; }
+      const p = projects.find(x => x.id === id);
+      if (!p) return;
+      const ids = cashOfProject(cash, p).map(t => t.id);
+      setProjects(ps => ps.filter(x => x.id !== id));
+      if (ids.length) setCash(cs => cs.filter(t => ids.indexOf(t.id) < 0));
+      if (cloud && storeRef.current) storeRef.current.removeProject(id, ids);
+      toast('Proyek ' + p.name + ' dihapus' + (ids.length ? '. ' + ids.length + ' mutasi kas terkait ikut dikoreksi.' : '.'), 'warn');
+    },
     addExpense: d => {
       setCash(cs => [{ id: uid('trx_out'), type: 'out', category: d.category, amount: d.amount, client: '-', note: d.note, date: new Date().toISOString(), account: d.account }, ...cs]);
       toast('Pengeluaran ' + rp(d.amount) + ' dicatat. Saldo kas berkurang.', 'warn');
@@ -3228,8 +3464,8 @@ function App({ boot }) {
     if (v === 'verifikasi') return fin.dpQueue.length + fin.settleQueue.length;
     if (v === 'tagihan') return fin.settleWaiting.length;
     if (v === 'prospek' && role === 'sales') return visible.filter(p => p.status === 'prospect_deal').length + fin.settleWaiting.length;
-    if (v === 'desain') return visible.filter(p => p.status === 'cl_design_draft').length;
-    if (v === 'cl') return visible.filter(p => p.cl && !p.cl.locked && p.invoice && p.invoice.dpStatus === 'verified' && latestMockup(p)).length;
+    if (v === 'desain') return visible.filter(p => p.status === 'cl_design_draft' && p.designStatus !== 'skipped').length;
+    if (v === 'cl') return visible.filter(p => p.cl && !p.cl.locked && p.invoice && p.invoice.dpStatus === 'verified' && (latestMockup(p) || p.designStatus === 'skipped')).length;
     if (v === 'produksi') return role === 'spv_produksi' ? visible.filter(p => p.status === 'in_rework').length : visible.filter(p => p.status === 'in_production' || p.status === 'in_rework').length;
     if (v === 'pengguna') return users.filter(u => u.role === 'pending').length;
     return 0;
@@ -3284,6 +3520,8 @@ function App({ boot }) {
     ${modal && modal.type === 'progress' ? h`<${ProgressModal} c=${c} pid=${modal.pid} onClose=${() => setModal(null)} />` : null}
     ${modal && modal.type === 'expense' ? h`<${ExpenseModal} c=${c} onClose=${() => setModal(null)} />` : null}
     ${modal && modal.type === 'doc' ? h`<${DocModal} c=${c} pid=${modal.pid} type=${modal.doc} onClose=${() => setModal(null)} />` : null}
+    ${modal && modal.type === 'edit' ? h`<${EditProjectModal} key=${modal.pid} c=${c} pid=${modal.pid} onClose=${() => setModal(null)} />` : null}
+    ${modal && modal.type === 'delete' ? h`<${DeleteProjectModal} c=${c} pid=${modal.pid} onClose=${() => setModal(null)} />` : null}
     ${modal && modal.type === 'settle' ? h`<${SettleModal} c=${c} pid=${modal.pid} onClose=${() => setModal(null)} />` : null}
     ${modal && modal.type === 'photo' ? h`<${Modal} title=${modal.title || 'Foto'} onClose=${() => setModal(null)}><img className="bigimg" src=${modal.src} alt=${modal.title || 'Foto'} /><//>` : null}
   </div>`;
